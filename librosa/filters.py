@@ -40,7 +40,6 @@ import numpy as np
 import scipy
 import scipy.signal
 import scipy.ndimage
-import six
 
 from numba import jit
 
@@ -50,7 +49,6 @@ from .util.exceptions import ParameterError
 
 from .core.time_frequency import note_to_hz, hz_to_midi, midi_to_hz, hz_to_octs
 from .core.time_frequency import fft_frequencies, mel_frequencies
-from .util.deprecation import Deprecated
 
 __all__ = ['mel',
            'chroma',
@@ -111,7 +109,7 @@ WINDOW_BANDWIDTHS = {'bart': 1.3334961334912805,
 
 @cache(level=10)
 def mel(sr, n_fft, n_mels=128, fmin=0.0, fmax=None, htk=False,
-        norm=1, dtype=np.float32):
+        norm='slaney', dtype=np.float32):
     """Create a Filterbank matrix to combine FFT bins into Mel-frequency bins
 
     Parameters
@@ -135,10 +133,13 @@ def mel(sr, n_fft, n_mels=128, fmin=0.0, fmax=None, htk=False,
     htk       : bool [scalar]
         use HTK formula instead of Slaney
 
-    norm : {None, 1, np.inf} [scalar]
-        if 1, divide the triangular mel weights by the width of the mel band
-        (area normalization).  Otherwise, leave all the triangles aiming for
-        a peak value of 1.0
+    norm : {None, 1, 'slaney', np.inf} [scalar]
+        If 1 or 'slaney', divide the triangular mel weights by the width of the mel band
+        (area normalization).
+        
+        .. warning:: `norm=1` and `norm=np.inf` behavior will change in version 0.8.0.
+
+        Otherwise, leave all the triangles aiming for a peak value of 1.0
 
     dtype : np.dtype
         The data type of the output basis.
@@ -187,8 +188,17 @@ def mel(sr, n_fft, n_mels=128, fmin=0.0, fmax=None, htk=False,
     if fmax is None:
         fmax = float(sr) / 2
 
-    if norm is not None and norm != 1 and norm != np.inf:
-        raise ParameterError('Unsupported norm: {}'.format(repr(norm)))
+    if norm == 1:
+        warnings.warn('norm=1 behavior will change in librosa 0.8.0. '
+                      "To maintain forward compatibility, use norm='slaney' instead.",
+                      FutureWarning)
+    elif norm == np.inf:
+        warnings.warn('norm=np.inf behavior will change in librosa 0.8.0. '
+                      "To maintain forward compatibility, use norm=None instead.",
+                      FutureWarning)
+
+    elif norm not in (None, 1, 'slaney', np.inf):
+        raise ParameterError("Unsupported norm={}, must be one of: None, 1, 'slaney', np.inf".format(repr(norm)))
 
     # Initialize the weights
     n_mels = int(n_mels)
@@ -211,10 +221,11 @@ def mel(sr, n_fft, n_mels=128, fmin=0.0, fmax=None, htk=False,
         # .. then intersect them with each other and zero
         weights[i] = np.maximum(0, np.minimum(lower, upper))
 
-    if norm == 1:
+    if norm in (1, 'slaney'):
         # Slaney-style mel is scaled to be approx constant energy per channel
         enorm = 2.0 / (mel_f[2:n_mels+2] - mel_f[:n_mels])
         weights *= enorm[:, np.newaxis]
+
 
     # Only check weights if f_mel[0] is positive
     if not np.all((mel_f[:-2] == 0) | (weights.max(axis=1) > 0)):
@@ -228,7 +239,7 @@ def mel(sr, n_fft, n_mels=128, fmin=0.0, fmax=None, htk=False,
 
 
 @cache(level=10)
-def chroma(sr, n_fft, n_chroma=12, tuning=0.0, A440=Deprecated(), ctroct=5.0,
+def chroma(sr, n_fft, n_chroma=12, tuning=0.0, ctroct=5.0,
            octwidth=2, norm=2, base_c=True, dtype=np.float32):
     """Create a Filterbank matrix to convert STFT to chroma
 
@@ -246,12 +257,6 @@ def chroma(sr, n_fft, n_chroma=12, tuning=0.0, A440=Deprecated(), ctroct=5.0,
 
     tuning : float
         Tuning deviation from A440 in fractions of a chroma bin.
-
-    A440      : float > 0 [scalar] <Deprecated>
-        Reference frequency for A440
-
-        .. note:: This parameter is deprecated in version 0.7.1.
-                  It will be removed in 0.8.0.  Use `tuning=` instead.
 
     ctroct    : float > 0 [scalar]
 
@@ -399,9 +404,9 @@ def __float_window(window_spec):
 
 
 @cache(level=10)
-def constant_q(sr, fmin=None, n_bins=84, bins_per_octave=12, tuning=Deprecated(),
-               window='hann', filter_scale=1, pad_fft=True, norm=1, gamma=0,
-               dtype=np.complex64, **kwargs):
+def constant_q(sr, fmin=None, n_bins=84, bins_per_octave=12, window='hann',
+               filter_scale=1, pad_fft=True, norm=1, dtype=np.complex64,
+               **kwargs):
     r'''Construct a constant-Q basis.
 
     This uses the filter bank described by [1]_.
@@ -424,12 +429,6 @@ def constant_q(sr, fmin=None, n_bins=84, bins_per_octave=12, tuning=Deprecated()
 
     bins_per_octave : int > 0 [scalar]
         Number of bins per octave
-
-    tuning : float [scalar] <DEPRECATED>
-        Tuning deviation from A440 in fractions of a bin
-
-        .. note:: This parameter is deprecated in 0.7.1.  It will be removed in
-                  version 0.8.
 
     window : string, tuple, number, or function
         Windowing function to apply to filters.
@@ -516,17 +515,6 @@ def constant_q(sr, fmin=None, n_bins=84, bins_per_octave=12, tuning=Deprecated()
     if fmin is None:
         fmin = note_to_hz('C1')
 
-    if isinstance(tuning, Deprecated):
-        tuning = 0.0
-    else:
-        warnings.warn('The `tuning` parameter to `filters.constant_q` '
-                      'is deprecated in librosa 0.7.1. '
-                      'It will be removed in 0.8.0.', DeprecationWarning)
-
-    # Apply tuning correction
-    correction = 2.0**(float(tuning) / bins_per_octave)
-    fmin = correction * fmin
-
     # Pass-through parameters to get the filter lengths
     lengths = constant_q_lengths(sr, fmin,
                                  n_bins=n_bins,
@@ -566,7 +554,7 @@ def constant_q(sr, fmin=None, n_bins=84, bins_per_octave=12, tuning=Deprecated()
 
 @cache(level=10)
 def constant_q_lengths(sr, fmin, n_bins=84, bins_per_octave=12,
-                       tuning=Deprecated(), window='hann', filter_scale=1, gamma=0):
+                       window='hann', filter_scale=1):
     r'''Return length of each filter in a constant-Q basis.
 
     Parameters
@@ -582,12 +570,6 @@ def constant_q_lengths(sr, fmin, n_bins=84, bins_per_octave=12,
 
     bins_per_octave : int > 0 [scalar]
         Number of bins per octave
-
-    tuning : float [scalar] <DEPRECATED>
-        Tuning deviation from A440 in fractions of a bin
-
-        .. note:: This parameter is deprecated in 0.7.1.  It will be removed in
-                  version 0.8.
 
     window : str or callable
         Window function to use on filters
@@ -621,15 +603,6 @@ def constant_q_lengths(sr, fmin, n_bins=84, bins_per_octave=12,
 
     if n_bins <= 0 or not isinstance(n_bins, int):
         raise ParameterError('n_bins must be a positive integer')
-
-    if isinstance(tuning, Deprecated):
-        tuning = 0.0
-    else:
-        warnings.warn('The `tuning` parameter to `filters.constant_q_lengths` is deprecated in librosa 0.7.1.'
-                      'It will be removed in 0.8.0.', DeprecationWarning)
-
-    correction = 2.0**(float(tuning) / bins_per_octave)
-    fmin = correction * fmin
 
     # Q should be capitalized here, so we suppress the name warning
     # pylint: disable=invalid-name
@@ -870,11 +843,10 @@ def get_window(window, Nx, fftbins=True):
         If `window` is supplied as a vector of length != `n_fft`,
         or is otherwise mis-specified.
     '''
-    if six.callable(window):
+    if callable(window):
         return window(Nx)
 
-    elif (isinstance(window, (six.string_types, tuple)) or
-          np.isscalar(window)):
+    elif (isinstance(window, (str, tuple)) or np.isscalar(window)):
         # TODO: if we add custom window functions in librosa, call them here
 
         return scipy.signal.get_window(window, Nx, fftbins=fftbins)
